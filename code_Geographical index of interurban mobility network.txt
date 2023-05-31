@@ -1,0 +1,342 @@
+#1. Distribution: hot spots identification
+library(readxl)
+od <- read_excel("D:/od.xlsx")
+
+# Calculate the degree of nodes
+library(dplyr)
+od %>%
+group_by(from) %>%
+summarize(out_degree = sum(flow))
+out_degree <- od %>%
+group_by(from) %>%
+summarize(out_degree = sum(flow))
+in_degree <- od %>%
+group_by(to) %>%
+summarize(in_degree = sum(flow))
+degree <- full_join(out_degree, in_degree, by = c("from" = "to"))
+degree$heat <- degree$out_degree + degree$in_degree
+colnames(degree) <- c("city", "out", "in", "heat")
+
+
+# build the od flow matrix
+library(reshape2)
+for(i in 1:nrow(od)) {
+  if(is.na(od$from[i])) next
+  
+  indx <- which(od$to==od$from[i] & od$from==od$to[i])
+  if(length(indx) == 1) {
+    od$flow[i] <- od$flow[i] + od$flow[indx]
+    od[indx,] <- NA
+  }
+}
+
+od <- od[!is.na(od$from),]
+rownames(od) <- seq(nrow(od))
+
+
+matrix <- dcast(od, from ~ to, value.var = "flow", fill = 0)
+rownames(matrix) <- matrix[, 1]
+matrix <- matrix[, -1]
+matrix <- matrix + t(matrix)
+diag(matrix) <- theheat  #Avoid deleting the city itself
+
+# Build the matrix of distance between nodes based on latitude and longitude
+haversine <- function(lat1, lon1, lat2, lon2) {
+  R <- 6371
+  dLat <- (lat2 - lat1) * pi / 180
+  dLon <- (lon2 - lon1) * pi / 180
+  a <- sin(dLat/2) * sin(dLat/2) + cos(lat1 * pi / 180) * cos(lat2 * pi / 180) * sin(dLon/2) * sin(dLon/2)
+  c <- 2 * atan2(sqrt(a), sqrt(1-a))
+  d <- R * c
+  return(d)
+}
+coords <- read_excel("D:/croods.xlsx") # latitude and longitude of cities
+dist <- matrix(0, nrow = nrow(coords), ncol = nrow(coords))
+for (i in 1:nrow(coords)) {
+  for (j in 1:nrow(coords)) {
+    dist[i, j] <- haversine(coords$y[i], coords$x[i], coords$y[j], coords$x[j])
+  }
+}
+
+rownames(dist) <- croods$city
+colnames(dist) <- croods$city
+
+# Create heat-based Spatial Clustering of Applications
+hbscan <- function(df, matrix, dist, minheat, threheat, eps) {
+  # Determine points in the neighborhood
+  neigh_points <- lapply(1:nrow(df), function(i) which(dist[i,] < eps))
+  
+  # Define core objects
+  core_objs <- sapply(1:nrow(df), function(i) sum(df[neigh_points[[i]], "heat"]) >= minheat)
+  
+  
+  # Define boundary objects
+  border_objs <- sapply(1:nrow(df), function(i) {
+    any(core_objs[neigh_points[[i]]]) & any(matrix[i, neigh_points[[i]]] >= threheat)
+  })
+  
+  # Initialize cluster labels
+  cluster_labels <- rep(0, nrow(df))
+  cluster_id <- 0
+  
+  # Define clusters
+  for (i in 1:nrow(df)) {
+    if (cluster_labels[i] != 0) next # skip if already visited
+    
+    if (core_objs[i]) {
+      # Start a new cluster
+      cluster_id <- cluster_id + 1
+      cluster_labels[i] <- cluster_id
+      
+      # Find all reachable core objects and border objects
+      q <- neigh_points[[i]]
+      while (length(q) > 0) {
+        j <- q[1]
+        q <- q[-1]
+        
+        if (cluster_labels[j] == 0) {
+          cluster_labels[j] <- cluster_id
+          
+          if (core_objs[j]) {
+            # Add all reachable core objects to the queue
+            q <- c(q, neigh_points[[j]])
+          }
+        }
+      }
+    } else {
+      cluster_labels[i] <- -1 # mark as noise
+    }
+  }
+  
+  return(cluster_labels)
+}
+
+
+
+# 2. Flow direction: identification of key channels
+library(sp)
+library(rgeos)
+library(sf)
+
+data <- od
+# Calculate the angle between the line segment and the x-axis.
+dipAngleOfLine <- function(p1, p2, direction=TRUE, degree=TRUE) {
+  # direction: Whether to consider the direction of the line segment, if it is TRUE, the angle has positive or negative
+  # degree: Whether to convert radians to degrees  
+  d <- atan2(p2[2]-p1[2],p2[1]-p1[1]) 
+  if(!direction && d<0) d <- d+pi
+  
+  if(degree) d <- d * 180/pi
+  
+  return(d)
+}
+data$lat1 <- data$Y1 * pi/180
+data$lon1 <- data$X1 * pi/180
+data$lat2 <- data$Y2 * pi/180
+data$lon2 <- data$X2 * pi/180
+
+data$`θ/°` <- dipAngleOfLine(
+      c(data[,'lon1'],data[,'lat1']), 
+      c(data[,'lon2'],data[,'lat2']), 
+      direction = TRUE)
+
+indx <- data$`θ/°` < 0
+data$`θ/°`[indx] <- data$`θ/°`[indx] + 180
+
+## Merge back and forth
+for(i in 1:nrow(data)) {
+  if(is.na(data$from[i])) next
+  
+  indx <- which(data$to==data$from[i] & data$from==data$to[i])
+  if(length(indx) == 1) {
+    stopifnot(abs(data$`θ/°`[i]-data$`θ/°`[indx]) < 1.0e-6)
+    
+    data$heat[i] <- data$heat[i] + data$heat[indx]
+    data[indx,] <- NA
+  }
+}
+
+data <- data[!is.na(data$from),]
+data <- data[order(data$heat, decreasing = TRUE),]
+rownames(data) <- seq(nrow(data))
+
+data <- cbind(Merged=FALSE, nid=seq(nrow(data)), data) # nid is to record number
+
+
+
+# Generate Vector Line Segments
+CreateLines <- function(ds, spObj = FALSE) {
+  if(!spObj) {
+    require(sf)
+    ll <- sapply(seq(nrow(ds)), function(i) {
+      st_sfc(
+        st_linestring(
+          rbind(
+            c(ds[i,'X1'],ds[i,'Y1']),
+            c(ds[i,'X2'],ds[i,'Y2'])
+          )
+        ), crs=4326)
+    })
+    
+    llc <- st_sf(ds, ll, crs=4326)
+    
+  } else {
+    require(sp)
+    ll <- SpatialLines(
+      sapply(1:nrow(ds), function(i) {
+        Lines(
+          Line(
+            rbind(
+              c(ds[i,'X1'],ds[i,'Y1']),
+              c(ds[i,'X2'],ds[i,'Y2'])
+            )
+          ), ID = ds[i, 'nid']
+        )
+      }),
+      proj4string = CRS("+proj=longlat +datum=WGS84")
+    )
+    
+    llc <- SpatialLinesDataFrame(ll, ds)
+  }
+  
+  return(llc)
+}
+
+# Generate sets of flows
+GroupLines <- function(ds, angleThreshold, distThreshold, withExtend=FALSE) {
+  ds$Merged <- FALSE
+  dsLines <- CreateLines(ds, spObj=TRUE)
+  
+  mergeList <- list()
+  k <- 1
+  
+  for(i in 1:nrow(ds)) {
+    if(ds$Merged[i]) next
+    
+    # Calculation of inclination from equirectangular projection coordinates
+    dip1 <- dipAngleOfLine(
+      c(ds[i,'lon1'],ds[i,'lat1']), 
+      c(ds[i,'lon2'],ds[i,'lat2']), 
+      direction = FALSE)
+    
+    # Calculate the distance between flows
+    l1 <- st_sfc(
+      st_linestring(
+        rbind(
+          c(ds[i,'X1'],ds[i,'Y1']),
+          c(ds[i,'X2'],ds[i,'Y2'])
+        )
+      ), crs=4326)
+    
+    buf <- rgeos::gBuffer(dsLines[i,], width = 4)
+    subdata <- dsLines[!ds$Merged,]
+    if(withExtend) {
+      indices <- subdata$nid[rgeos::gIntersects(buf, subdata, byid = TRUE)]
+    } else {
+      indices <- subdata$nid[rgeos::gContains(buf, subdata, byid = TRUE)]
+    }
+    
+    ds$Merged[i] <- TRUE
+    lst <- c()
+    
+    for(j in indices) {
+      print(c(i,j))
+      if(is.na(ds$heat[j])) next
+      
+      dip2 <- dipAngleOfLine(
+        c(ds[i,'lon1'],ds[i,'lat1']), 
+        c(ds[i,'lon2'],ds[i,'lat2']), 
+        direction = FALSE)
+      
+      # Angle between two line segments
+      angle <- abs(dip1-dip2)
+      
+      # Filter out geographically adjacent mobility
+      if(angle < angleThreshold || angle < (180-angleThreshold)) {
+        
+        if(withExtend) {
+          # the minmum distance between line segements
+          l2 <- st_sfc(
+            st_linestring(
+              rbind(
+                c(ds[j,'X1'],ds[j,'Y1']),
+                c(ds[j,'X2'],ds[j,'Y2'])
+              )
+            ), crs=4326)
+          distance <- as.double(st_distance(l2,l1))/1000
+        } else {
+          p21 <- st_sfc(st_point(c(ds[j,'X1'], ds[j,'Y1'])), crs=4326)
+          p22 <- st_sfc(st_point(c(ds[j,'X2'], ds[j,'Y2'])), crs=4326)
+          distance <- as.double(max(st_distance(p21,l1), st_distance(p22,l1))/1000)
+        }
+        
+        if(distance < distThreshold) {
+          lst <- rbind(lst, data.frame(nid=j, angle=angle, dist=distance))
+          ds$Merged[j] <- TRUE
+        }
+      }
+    }
+    
+    mergeList[[k]] <- lst
+    k <- k+1
+  }  
+  
+  return(mergeList)
+}
+
+# Merge and statistics flow sets properties
+MergeLines <- function(ds, groupList) {
+  SingleAisle <- function(ds0) {
+    df <- ds0[1,-1,drop=FALSE]
+    df$heat <- sum(ds0$heat)
+    df$No <- sum(ds0$No)
+    if(df$No == 0) df$No <- nrow(ds0)
+    
+    p1 <- st_sfc(st_point(c(df[1,'X1'], df[1,'Y1'])), crs=4326)
+    p2 <- st_sfc(st_point(c(df[1,'X2'], df[1,'Y2'])), crs=4326)
+        
+    return(df)
+  }
+  
+  lines <- lapply(1:length(groupList), function(i) {
+    SingleAisle(ds[groupList[[i]]$nid,])
+  })
+  lines <- do.call(rbind, lines)
+  
+  lines <- lines[order(lines$heat, decreasing = TRUE),]
+  lines$nid <- seq(nrow(lines))
+  row.names(lines) <- lines$nid
+  
+  return(lines)
+}
+
+angleThreshold <- 10 # degree
+distThreshold <- 100 # km
+
+groupList <- GroupLines(data, angleThreshold, distThreshold)
+
+# Export the top several sets of heat
+for(m in 1:150) {
+  sf::st_write(CreateLines(data[groupList[[m]]$nid,]), 
+           sprintf('ll_%d.shp', m), 
+           layer_options = "ENCODING=UTF-8")
+}
+
+# Merge line segments to generate channels and export
+lines <- MergeLines(data, groupList)
+spLines <- CreateLines(lines)
+sf::st_write(spLines, 
+             sprintf('ang10_dist%d_aisle.shp', distThreshold), 
+             layer_options = "ENCODING=UTF-8", delete_layer=TRUE)
+
+# 3. Sub-region: potential energy of regions
+# Partition
+data$x1 <- cut(data$X1,breaks = c(-Inf,109.997325,116,Inf),labels = c("1","2","3"))
+data$x2 <- cut(data$X2,breaks = c(-Inf,109.997325,116,Inf),labels = c("1","2","3"))
+data$y1 <- cut(data$Y1,breaks = c(-Inf,26.896879,33.069500,40,Inf),labels = c("1","2","3","4"))
+data$y2 <- cut(data$Y2,breaks = c(-Inf,26.896879,33.069500,40,Inf),labels = c("1","2","3","4"))
+# Calculate potential energy
+library(dplyr)
+result <- data %>% 
+  group_by(x1, y1) %>% 
+  summarise(Sum_heat = sum(heat))
