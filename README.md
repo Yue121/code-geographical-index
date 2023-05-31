@@ -5,6 +5,8 @@
 # Reference
 a set of quantitative and promotable city mobility network analysis methods and algorithms, and can be implemented for multiple spatial entity networks.
 
+# Casedata Download
+* **Link 1**: [figshare](https://doi.org/10.6084/m9.figshare.23264885.v1)
 
 # Contact Information
 If you have any query for this work, please directly contact the corresponding Author.
